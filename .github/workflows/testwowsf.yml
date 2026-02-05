@@ -1,13 +1,8 @@
 name: three jobs
 
 on:
-  #schedule:
-    # 核心修改点：
-    # 分钟：0,30 (每小时的第0分钟和第30分钟执行)
-    # 小时：16-23 (从早上0点到上午7点)
-    # 后面三个 * 分别代表：日、月、周
-    # 注意：GitHub Action 使用的是 UTC 时间
-    #- cron: '0,30 16-23 * * *' 
+  schedule:
+    - cron: '0 14 * * *' 
   workflow_dispatch: # 保持保留，方便手动测试
 
 jobs:
@@ -34,23 +29,8 @@ jobs:
           sleep 60
         done
 
-  data-processing:
-    needs: check-service
-    runs-on: ubuntu-latest
-    steps:
-    - name: Keep alive & run
-      timeout-minutes: 359
-      run: |
-        # run script
-        # nohup python very_long_task.py > long.log 2>&1 &
-
-        for i in {1..360}; do
-          echo "data-processing Keep-alive heartbeat $i/360   $(date)"
-          sleep 60
-        done
-
   notify:
-    needs: [check-service, data-processing] # 依赖多个 Job
+    needs: [check-service] # 依赖多个 Job
     runs-on: ubuntu-latest
     steps:
       - run: echo "执行最后一步通知..."
