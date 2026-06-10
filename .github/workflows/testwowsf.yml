@@ -9,6 +9,9 @@ concurrency:
   group: ${{ github.workflow }}          # 或使用更固定的名称
   cancel-in-progress: true               # 关键：取消正在运行的旧实例
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   check-service:
     runs-on: ubuntu-latest
