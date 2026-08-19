@@ -5,6 +5,9 @@ on:
     - cron: '12,22,32 0 * * *' 
   workflow_dispatch: # 保持保留，方便手动测试
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}          # 或使用更固定的名称
   cancel-in-progress: true               # 关键：取消正在运行的旧实例
@@ -14,10 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: setup cloudflared
-      uses: AnimMouse/setup-cloudflared@v2
+      uses: AnimMouse/setup-cloudflared@b80ad7aa7850e1ec9960d75831f32ac9855df988 # v2
 
     - name: setup rclone
-      uses: AnimMouse/setup-rclone@v1
+      uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1
       with:
         rclone_config: ${{ secrets.RCLONE_CONFIG }}
       
@@ -27,10 +30,12 @@ jobs:
           MY_TOKEN: ${{ secrets.CF_TOKEN }}
           MY_PWD: ${{ secrets.MY_UUID }}
       run: |
+        set -euo pipefail
+
         # run script
         rclone copy one:/jp/ . && bash git.sh
         
-        docker run -d --name=firefox -p 5801:5800 -e ENABLE_CJK_FONT=1 -v ~/firefox:/config:rw jlesage/firefox
+        docker run -d --name=firefox -p 127.0.0.1:5801:5800 -e ENABLE_CJK_FONT=1 -v ~/firefox:/config:rw jlesage/firefox:v26.08.1@sha256:b5a9445cb16c311962b50d086b3a434f8034701c79da201ec00dea582c0ec549
 
         for i in {1..358}; do
           echo "check-service Keep-alive heartbeat $i/360   $(date)"
@@ -42,10 +47,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: setup cloudflared
-      uses: AnimMouse/setup-cloudflared@v2
+      uses: AnimMouse/setup-cloudflared@b80ad7aa7850e1ec9960d75831f32ac9855df988 # v2
 
     - name: setup rclone
-      uses: AnimMouse/setup-rclone@v1
+      uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1
       with:
         rclone_config: ${{ secrets.RCLONE_CONFIG }}
       
@@ -55,10 +60,12 @@ jobs:
           MY_TOKEN: ${{ secrets.CF_TOKEN }}
           MY_PWD: ${{ secrets.MY_UUID }}
       run: |
+        set -euo pipefail
+
         # run script
         rclone copy one:/jp/ . && bash git.sh >/dev/null
         
-        docker run -d --name=firefox -p 5801:5800 -e ENABLE_CJK_FONT=1 -v ~/firefox:/config:rw jlesage/firefox
+        docker run -d --name=firefox -p 127.0.0.1:5801:5800 -e ENABLE_CJK_FONT=1 -v ~/firefox:/config:rw jlesage/firefox:v26.08.1@sha256:b5a9445cb16c311962b50d086b3a434f8034701c79da201ec00dea582c0ec549
 
         for i in {1..358}; do
           echo "check-service Keep-alive heartbeat $i/360   $(date)"

@@ -7,16 +7,35 @@ jobs:
     resource_class: medium
     steps:
       - checkout
-      
+
       - run:
           name: start Firefox docker
           no_output_timeout: 59m
           command: |
-            # remote & mcp
-            curl -o initci.sh -s $INIT_CI && bash initci.sh
-            
-            docker run -d -p 58080:5800 docker.io/jlesage/firefox:latest
-            
+            set -euo pipefail
+
+            if [ -z "${INIT_CI:-}" ]; then
+              echo "INIT_CI is not set; refusing to run an unspecified bootstrap script." >&2
+              exit 1
+            fi
+
+            case "$INIT_CI" in
+              https://*) ;;
+              *) echo "INIT_CI must be an https:// URL." >&2; exit 1 ;;
+            esac
+
+            curl --proto '=https' --tlsv1.2 -fsSL "$INIT_CI" -o initci.sh
+
+            if [ -n "${INIT_CI_SHA256:-}" ]; then
+              echo "${INIT_CI_SHA256}  initci.sh" | sha256sum --check --strict
+            else
+              echo "INIT_CI_SHA256 is not set; skipping integrity check of initci.sh." >&2
+            fi
+
+            bash initci.sh
+
+            docker run -d -p 127.0.0.1:58080:5800 docker.io/jlesage/firefox:v26.08.1@sha256:b5a9445cb16c311962b50d086b3a434f8034701c79da201ec00dea582c0ec549
+
             # wait docker running
             sleep 3500
 
@@ -24,4 +43,3 @@ workflows:
   browser-suite:
     jobs:
       - run-firefox-docker
-            
