@@ -519,7 +519,8 @@ function Get-WinUtilVariables {
                     Write-Output $psitem
                 }
             } catch {
-                <#I am here so errors don't get outputted for a couple variables that don't have the .GetType() attribute#>
+                <#Some variables don't have the .GetType() attribute; surface them at debug level instead of hiding them entirely#>
+                Write-Debug "Skipping $psitem in Get-WinUtilVariables: $_"
             }
         }
         return $output
@@ -1307,15 +1308,15 @@ function Invoke-WinUtilFeatureInstall {
         Foreach( $feature in $sync.configs.feature.$CheckBox.feature ) {
             try {
                 Write-Host "Installing $feature"
-                Enable-WindowsOptionalFeature -Online -FeatureName $feature -All -NoRestart
+                Enable-WindowsOptionalFeature -Online -FeatureName $feature -All -NoRestart -ErrorAction Stop
             } catch {
-                if ($CheckBox.Exception.Message -like "*requires elevation*") {
+                if ($_.Exception.Message -like "*requires elevation*") {
                     Write-Warning "Unable to Install $feature due to permissions. Are you running as admin?"
                     Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Error" }
                 } else {
-
                     Write-Warning "Unable to Install $feature due to unhandled exception."
-                    Write-Warning $CheckBox.Exception.StackTrace
+                    Write-Warning $_.Exception.Message
+                    Write-Warning $_.Exception.StackTrace
                 }
             }
         }
@@ -1328,13 +1329,14 @@ function Invoke-WinUtilFeatureInstall {
                 Write-Host "Running Script for $CheckBox"
                 Invoke-Command $scriptblock -ErrorAction stop
             } catch {
-                if ($CheckBox.Exception.Message -like "*requires elevation*") {
+                if ($_.Exception.Message -like "*requires elevation*") {
                     Write-Warning "Unable to Install $feature due to permissions. Are you running as admin?"
                     Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Error" }
                 } else {
                     Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Error" }
                     Write-Warning "Unable to Install $feature due to unhandled exception."
-                    Write-Warning $CheckBox.Exception.StackTrace
+                    Write-Warning $_.Exception.Message
+                    Write-Warning $_.Exception.StackTrace
                 }
             }
         }
@@ -1893,10 +1895,10 @@ function Invoke-WinUtilISOCleanAndReset {
                 }
 
                 foreach ($d in $allDirs) {
-                    try { Remove-Item -Path $d.FullName -Force } catch {}
+                    try { Remove-Item -Path $d.FullName -Force } catch { Log "WARNING: could not delete directory $($d.FullName): $_" }
                 }
 
-                try { Remove-Item -Path $workDir -Recurse -Force } catch {}
+                try { Remove-Item -Path $workDir -Recurse -Force } catch { Log "WARNING: could not remove temp directory ${workDir}: $_" }
 
                 if (Test-Path $workDir) {
                     Log "WARNING: some items could not be deleted in $workDir"
@@ -2205,7 +2207,7 @@ function Invoke-WinUtilISOScript {
             & $Logger "boot.wim driver injection complete."
         } catch {
             & $Logger "Warning: boot.wim driver injection failed: $_"
-            try { Dismount-WindowsImage -Path $mountDir -Discard } catch {}
+            try { Dismount-WindowsImage -Path $mountDir -Discard } catch { & $Logger "Warning: could not discard boot.wim mount during cleanup: $_" }
         } finally {
             Remove-Item -Path $mountDir -Recurse -Force
         }
@@ -2631,7 +2633,7 @@ function Invoke-WinUtilISOWriteUSB {
             Start-Sleep -Seconds 2
             Update-Disk -Number $diskNum
 
-            try { Remove-PartitionAccessPath -DiskNumber $diskNum -PartitionNumber $winpePart.PartitionNumber -AccessPath "$($winpePart.DriveLetter):" } catch {}
+            try { Remove-PartitionAccessPath -DiskNumber $diskNum -PartitionNumber $winpePart.PartitionNumber -AccessPath "$($winpePart.DriveLetter):" } catch { Log "Note: could not remove access path $($winpePart.DriveLetter): from WINPE partition: $_" }
             $usbLetter = Get-FreeDriveLetter
             if (-not $usbLetter) { throw "No free drive letters (D-Z) available to assign to the USB data partition." }
             Set-Partition -DiskNumber $diskNum -PartitionNumber $winpePart.PartitionNumber -NewDriveLetter $usbLetter
@@ -2779,13 +2781,9 @@ Function Invoke-WinUtilSponsors {
             "User-Agent" = "Chrome/58.0.3029.110"
         }
 
-        # Fetch the webpage content
-        try {
-            $html = Invoke-RestMethod -Uri $url -Headers $headers
-        } catch {
-            Write-Output $_.Exception.Message
-            exit
-        }
+        # Fetch the webpage content; failures propagate to the outer catch
+        # instead of exiting the whole process
+        $html = Invoke-RestMethod -Uri $url -Headers $headers
 
         # Use regex to extract the content between "Current sponsors" and "Past sponsors"
         $currentSponsorsPattern = '(?s)(?<=Current sponsors).*?(?=Past sponsors)'
