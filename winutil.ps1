@@ -376,11 +376,7 @@ function Get-WinUtilSelectedPackages
         [PackageManagers]$Preference
     )
 
-    if ($PackageList.count -eq 1) {
-        Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Indeterminate" -value 0.01 -overlay "logo" }
-    } else {
-        Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Normal" -value 0.01 -overlay "logo" }
-    }
+    Set-WinUtilTaskbarStatus -Status "Running" -ItemCount $PackageList.count
 
     $packages = [System.Collections.Hashtable]::new()
     $packagesWinget = [System.Collections.ArrayList]::new()
@@ -1442,7 +1438,49 @@ function Invoke-WinUtilInstallPSProfile {
 
     wt new-tab pwsh -NoExit -Command "irm https://github.com/ChrisTitusTech/powershell-profile/raw/main/setup.ps1 | iex"
 }
+function Write-WinUtilBanner {
+    <#
+    .SYNOPSIS
+        Writes one or more lines to the console inside a banner of '=' characters
+    .PARAMETER Message
+        The lines to display inside the banner
+    .PARAMETER ForegroundColor
+        Console color applied to the whole banner
+    #>
+    param(
+        [Parameter(Mandatory, Position=0)][string[]]$Message,
+        [string]$ForegroundColor
+    )
+
+    $width = ($Message | Measure-Object -Property Length -Maximum).Maximum
+    $border = "=" * ($width + 8)
+
+    $lines = @($border)
+    foreach ($line in $Message) {
+        $padding = $width - $line.Length
+        $left = [Math]::Floor($padding / 2)
+        $lines += "--- " + (" " * $left) + $line + (" " * ($padding - $left)) + " ---"
+    }
+    $lines += $border
+
+    foreach ($line in $lines) {
+        if ($ForegroundColor) {
+            Write-Host $line -ForegroundColor $ForegroundColor
+        } else {
+            Write-Host $line
+        }
+    }
+}
 function Write-Win11ISOLog {
+    <#
+    .SYNOPSIS
+        Appends a timestamped message to the Windows 11 ISO status log
+    .DESCRIPTION
+        The message is always written to the status log text box. When $sync["Win11ISOLogFile"] is set,
+        the message is also appended to that file.
+    .PARAMETER Message
+        The message to log
+    #>
     param([string]$Message)
     $ts = (Get-Date).ToString("HH:mm:ss")
     $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
@@ -1455,6 +1493,87 @@ function Write-Win11ISOLog {
         $sync["WPFWin11ISOStatusLog"].CaretIndex = $sync["WPFWin11ISOStatusLog"].Text.Length
         $sync["WPFWin11ISOStatusLog"].ScrollToEnd()
     })
+
+    if ($sync["Win11ISOLogFile"]) {
+        try { Add-Content -Path $sync["Win11ISOLogFile"] -Value "[$ts] $Message" -ErrorAction Stop }
+        catch { Write-Debug "Could not append to $($sync['Win11ISOLogFile']): $_" }
+    }
+}
+
+function Set-Win11ISOProgress {
+    <#
+    .SYNOPSIS
+        Updates the progress bar shown on the Windows 11 ISO tab
+    .PARAMETER Label
+        The text overlaid onto the progress bar
+    .PARAMETER Percent
+        The percentage of the progress bar that should be filled, 0 empties the bar
+    #>
+    param(
+        [Parameter(Position=0)][string]$Label,
+        [Parameter(Position=1)][ValidateRange(0,100)][int]$Percent
+    )
+
+    $value = if ($Percent -le 0) { 0 } else { [Math]::Max($Percent, 5) }
+
+    $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
+        $sync.progressBarTextBlock.Text    = $Label
+        $sync.progressBarTextBlock.ToolTip = $Label
+        $sync.ProgressBar.Value            = $value
+    })
+}
+
+function Get-Win11ISOWorkDirectory {
+    <#
+    .SYNOPSIS
+        Returns the most recently used WinUtil ISO working directory in %TEMP%, if one exists
+    #>
+    Get-Item -Path (Join-Path $env:TEMP "WinUtil_Win11ISO*") -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSIsContainer } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+
+function Start-WinUtilISORunspace {
+    <#
+    .SYNOPSIS
+        Runs a scriptblock in a dedicated STA runspace used by the Windows 11 ISO tab
+    .DESCRIPTION
+        $sync and the ISO helper functions (Write-Win11ISOLog, Set-Win11ISOProgress,
+        Invoke-WinUtilISOScript) are always available inside the runspace, since the ISO tab does not
+        use the shared runspace pool that imports every WinUtil function.
+    .PARAMETER ScriptBlock
+        The scriptblock to run in the runspace
+    .PARAMETER Variables
+        Variables to expose inside the runspace, keyed by variable name
+    #>
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [hashtable]$Variables = @{}
+    )
+
+    $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $runspace.ApartmentState = "STA"
+    $runspace.ThreadOptions  = "ReuseThread"
+    $runspace.Open()
+
+    $runspace.SessionStateProxy.SetVariable("sync", $sync)
+    foreach ($name in $Variables.Keys) {
+        $runspace.SessionStateProxy.SetVariable($name, $Variables[$name])
+    }
+
+    $helperDefinitions = @("Write-Win11ISOLog", "Set-Win11ISOProgress", "Invoke-WinUtilISOScript") | ForEach-Object {
+        "function $_ {`n" + (Get-Item "function:\$_").ScriptBlock.ToString() + "`n}"
+    }
+    $runspace.SessionStateProxy.SetVariable("isoHelperDefinitions", ($helperDefinitions -join "`n"))
+    $runspace.SessionStateProxy.SetVariable("isoRunspaceBody", $ScriptBlock.ToString())
+
+    $script = [Management.Automation.PowerShell]::Create()
+    $script.Runspace = $runspace
+    $script.AddScript({
+        . ([scriptblock]::Create($isoHelperDefinitions))
+        . ([scriptblock]::Create($isoRunspaceBody))
+    })
+
+    return $script.BeginInvoke()
 }
 
 function Invoke-WinUtilISOBrowse {
@@ -1595,8 +1714,7 @@ function Invoke-WinUtilISOModify {
     $sync["WPFWin11ISOModifyButton"].IsEnabled = $false
     $sync["Win11ISOModifying"] = $true
 
-    $existingWorkDir = Get-Item -Path (Join-Path $env:TEMP "WinUtil_Win11ISO*") |
-        Where-Object { $_.PSIsContainer } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $existingWorkDir = Get-Win11ISOWorkDirectory
 
     $workDir = if ($existingWorkDir) {
         Write-Win11ISOLog "Reusing existing temp directory: $($existingWorkDir.FullName)"
@@ -1604,6 +1722,7 @@ function Invoke-WinUtilISOModify {
     } else {
         Join-Path $env:TEMP "WinUtil_Win11ISO_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
     }
+    $sync["Win11ISOLogFile"] = Join-Path $workDir "WinUtil_Win11ISO.log"
 
     $autounattendContent = if ($WinUtilAutounattendXml) {
         $WinUtilAutounattendXml
@@ -1612,51 +1731,20 @@ function Invoke-WinUtilISOModify {
         if (Test-Path $toolsXml) { Get-Content $toolsXml -Raw } else { "" }
     }
 
-    $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $runspace.ApartmentState = "STA"
-    $runspace.ThreadOptions  = "ReuseThread"
-    $runspace.Open()
     $injectDrivers = $sync["WPFWin11ISOInjectDrivers"].IsChecked -eq $true
 
-    $runspace.SessionStateProxy.SetVariable("sync",                $sync)
-    $runspace.SessionStateProxy.SetVariable("isoPath",             $isoPath)
-    $runspace.SessionStateProxy.SetVariable("driveLetter",         $driveLetter)
-    $runspace.SessionStateProxy.SetVariable("wimPath",             $wimPath)
-    $runspace.SessionStateProxy.SetVariable("workDir",             $workDir)
-    $runspace.SessionStateProxy.SetVariable("selectedWimIndex",    $selectedWimIndex)
-    $runspace.SessionStateProxy.SetVariable("selectedEditionName", $selectedEditionName)
-    $runspace.SessionStateProxy.SetVariable("autounattendContent", $autounattendContent)
-    $runspace.SessionStateProxy.SetVariable("injectDrivers",       $injectDrivers)
+    $isoRunspaceVariables = @{
+        isoPath             = $isoPath
+        driveLetter         = $driveLetter
+        wimPath             = $wimPath
+        workDir             = $workDir
+        selectedWimIndex    = $selectedWimIndex
+        selectedEditionName = $selectedEditionName
+        autounattendContent = $autounattendContent
+        injectDrivers       = $injectDrivers
+    }
 
-    $isoScriptFuncDef   = "function Invoke-WinUtilISOScript {`n" + ${function:Invoke-WinUtilISOScript}.ToString() + "`n}"
-    $win11ISOLogFuncDef = "function Write-Win11ISOLog {`n"       + ${function:Write-Win11ISOLog}.ToString()       + "`n}"
-    $runspace.SessionStateProxy.SetVariable("isoScriptFuncDef",   $isoScriptFuncDef)
-    $runspace.SessionStateProxy.SetVariable("win11ISOLogFuncDef", $win11ISOLogFuncDef)
-
-    $script = [Management.Automation.PowerShell]::Create()
-    $script.Runspace = $runspace
-    $script.AddScript({
-        . ([scriptblock]::Create($isoScriptFuncDef))
-        . ([scriptblock]::Create($win11ISOLogFuncDef))
-
-        function Log($msg) {
-            $ts = (Get-Date).ToString("HH:mm:ss")
-            $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync["WPFWin11ISOStatusLog"].Text += "`n[$ts] $msg"
-                $sync["WPFWin11ISOStatusLog"].CaretIndex = $sync["WPFWin11ISOStatusLog"].Text.Length
-                $sync["WPFWin11ISOStatusLog"].ScrollToEnd()
-            })
-            Add-Content -Path (Join-Path $workDir "WinUtil_Win11ISO.log") -Value "[$ts] $msg"
-        }
-
-        function SetProgress($label, $pct) {
-            $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync.progressBarTextBlock.Text    = $label
-                $sync.progressBarTextBlock.ToolTip = $label
-                $sync.ProgressBar.Value            = [Math]::Max($pct, 5)
-            })
-        }
-
+    Start-WinUtilISORunspace -Variables $isoRunspaceVariables -ScriptBlock {
         try {
             $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
                 $sync["WPFWin11ISOSelectSection"].Visibility = "Collapsed"
@@ -1664,87 +1752,87 @@ function Invoke-WinUtilISOModify {
                 $sync["WPFWin11ISOModifySection"].Visibility = "Collapsed"
             })
 
-            Log "Creating working directory: $workDir"
+            Write-Win11ISOLog "Creating working directory: $workDir"
             $isoContents = Join-Path $workDir "iso_contents"
             $mountDir    = Join-Path $workDir "wim_mount"
             New-Item -ItemType Directory -Path $isoContents, $mountDir -Force
-            SetProgress "Copying ISO contents..." 10
+            Set-Win11ISOProgress "Copying ISO contents..." 10
 
-            Log "Copying ISO contents from $driveLetter to $isoContents..."
+            Write-Win11ISOLog "Copying ISO contents from $driveLetter to $isoContents..."
             & robocopy $driveLetter $isoContents /E /NFL /NDL /NJH /NJS
-            Log "ISO contents copied."
-            SetProgress "Mounting install.wim..." 25
+            Write-Win11ISOLog "ISO contents copied."
+            Set-Win11ISOProgress "Mounting install.wim..." 25
 
             $localWim = Join-Path $isoContents "sources\install.wim"
             if (-not (Test-Path $localWim)) { $localWim = Join-Path $isoContents "sources\install.esd" }
             Set-ItemProperty -Path $localWim -Name IsReadOnly -Value $false
 
-            Log "Mounting install.wim (Index ${selectedWimIndex}: $selectedEditionName) at $mountDir..."
+            Write-Win11ISOLog "Mounting install.wim (Index ${selectedWimIndex}: $selectedEditionName) at $mountDir..."
             Mount-WindowsImage -ImagePath $localWim -Index $selectedWimIndex -Path $mountDir
-            SetProgress "Modifying install.wim..." 45
+            Set-Win11ISOProgress "Modifying install.wim..." 45
 
-            Log "Applying WinUtil modifications to install.wim..."
-            Invoke-WinUtilISOScript -ScratchDir $mountDir -ISOContentsDir $isoContents -AutoUnattendXml $autounattendContent -InjectCurrentSystemDrivers $injectDrivers -Log { param($m) Log $m }
+            Write-Win11ISOLog "Applying WinUtil modifications to install.wim..."
+            Invoke-WinUtilISOScript -ScratchDir $mountDir -ISOContentsDir $isoContents -AutoUnattendXml $autounattendContent -InjectCurrentSystemDrivers $injectDrivers -Log { param($m) Write-Win11ISOLog $m }
 
-            SetProgress "Cleaning up component store (WinSxS)..." 56
-            Log "Running DISM component store cleanup (/ResetBase)..."
-            & dism /English "/image:$mountDir" /Cleanup-Image /StartComponentCleanup /ResetBase | ForEach-Object { Log $_ }
-            Log "Component store cleanup complete."
+            Set-Win11ISOProgress "Cleaning up component store (WinSxS)..." 56
+            Write-Win11ISOLog "Running DISM component store cleanup (/ResetBase)..."
+            & dism /English "/image:$mountDir" /Cleanup-Image /StartComponentCleanup /ResetBase | ForEach-Object { Write-Win11ISOLog $_ }
+            Write-Win11ISOLog "Component store cleanup complete."
 
-            SetProgress "Saving modified install.wim..." 65
-            Log "Dismounting and saving install.wim. This will take several minutes..."
+            Set-Win11ISOProgress "Saving modified install.wim..." 65
+            Write-Win11ISOLog "Dismounting and saving install.wim. This will take several minutes..."
             Dismount-WindowsImage -Path $mountDir -Save
-            Log "install.wim saved."
+            Write-Win11ISOLog "install.wim saved."
 
-            SetProgress "Removing unused editions from install.wim..." 70
-            Log "Exporting edition '$selectedEditionName' (Index $selectedWimIndex) to a single-edition install.wim..."
+            Set-Win11ISOProgress "Removing unused editions from install.wim..." 70
+            Write-Win11ISOLog "Exporting edition '$selectedEditionName' (Index $selectedWimIndex) to a single-edition install.wim..."
             $exportWim = Join-Path $isoContents "sources\install_export.wim"
             Export-WindowsImage -SourceImagePath $localWim -SourceIndex $selectedWimIndex -DestinationImagePath $exportWim
             Remove-Item -Path $localWim -Force
             Rename-Item -Path $exportWim -NewName "install.wim" -Force
             $localWim = Join-Path $isoContents "sources\install.wim"
-            Log "Unused editions removed. install.wim now contains only '$selectedEditionName'."
+            Write-Win11ISOLog "Unused editions removed. install.wim now contains only '$selectedEditionName'."
 
-            SetProgress "Dismounting source ISO..." 80
-            Log "Dismounting original ISO..."
+            Set-Win11ISOProgress "Dismounting source ISO..." 80
+            Write-Win11ISOLog "Dismounting original ISO..."
             Dismount-DiskImage -ImagePath $isoPath
 
             $sync["Win11ISOWorkDir"]     = $workDir
             $sync["Win11ISOContentsDir"] = $isoContents
 
-            SetProgress "Modification complete" 100
-            Log "install.wim modification complete. Choose an output option in Step 4."
+            Set-Win11ISOProgress "Modification complete" 100
+            Write-Win11ISOLog "install.wim modification complete. Choose an output option in Step 4."
 
             $sync["WPFWin11ISOOutputSection"].Dispatcher.Invoke([action]{
                 $sync["WPFWin11ISOOutputSection"].Visibility = "Visible"
             })
         } catch {
-            Log "ERROR during modification: $_"
+            Write-Win11ISOLog "ERROR during modification: $_"
 
             try {
                 if (Test-Path $mountDir) {
                     $mountedImages = Get-WindowsImage -Mounted | Where-Object { $_.Path -eq $mountDir }
                     if ($mountedImages) {
-                        Log "Cleaning up: dismounting install.wim (discarding changes)..."
+                        Write-Win11ISOLog "Cleaning up: dismounting install.wim (discarding changes)..."
                         Dismount-WindowsImage -Path $mountDir -Discard
                     }
                 }
-            } catch { Log "Warning: could not dismount install.wim during cleanup: $_" }
+            } catch { Write-Win11ISOLog "Warning: could not dismount install.wim during cleanup: $_" }
 
             try {
                 $mountedISO = Get-DiskImage -ImagePath $isoPath
                 if ($mountedISO -and $mountedISO.Attached) {
-                    Log "Cleaning up: dismounting source ISO..."
+                    Write-Win11ISOLog "Cleaning up: dismounting source ISO..."
                     Dismount-DiskImage -ImagePath $isoPath
                 }
-            } catch { Log "Warning: could not dismount ISO during cleanup: $_" }
+            } catch { Write-Win11ISOLog "Warning: could not dismount ISO during cleanup: $_" }
 
             try {
                 if (Test-Path $workDir) {
-                    Log "Cleaning up: removing temp directory $workDir..."
+                    Write-Win11ISOLog "Cleaning up: removing temp directory $workDir..."
                     Remove-Item -Path $workDir -Recurse -Force
                 }
-            } catch { Log "Warning: could not remove temp directory during cleanup: $_" }
+            } catch { Write-Win11ISOLog "Warning: could not remove temp directory during cleanup: $_" }
 
             $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
                 [System.Windows.MessageBox]::Show(
@@ -1754,10 +1842,8 @@ function Invoke-WinUtilISOModify {
         } finally {
             Start-Sleep -Milliseconds 800
             $sync["Win11ISOModifying"] = $false
+            Set-Win11ISOProgress -Label "" -Percent 0
             $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync.progressBarTextBlock.Text    = ""
-                $sync.progressBarTextBlock.ToolTip = ""
-                $sync.ProgressBar.Value            = 0
                 $sync["WPFWin11ISOModifyButton"].IsEnabled = $true
                 if ($sync["WPFWin11ISOOutputSection"].Visibility -ne "Visible") {
                     $sync["WPFWin11ISOSelectSection"].Visibility = "Visible"
@@ -1766,9 +1852,7 @@ function Invoke-WinUtilISOModify {
                 }
             })
         }
-    })
-
-    $script.BeginInvoke()
+    }
 }
 
 function Invoke-WinUtilISOCheckExistingWork {
@@ -1779,8 +1863,7 @@ function Invoke-WinUtilISOCheckExistingWork {
         return
     }
 
-    $existingWorkDir = Get-Item -Path (Join-Path $env:TEMP "WinUtil_Win11ISO*") |
-        Where-Object { $_.PSIsContainer } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $existingWorkDir = Get-Win11ISOWorkDirectory
 
     if (-not $existingWorkDir) { return }
 
@@ -1817,35 +1900,7 @@ function Invoke-WinUtilISOCleanAndReset {
 
     $sync["WPFWin11ISOCleanResetButton"].IsEnabled = $false
 
-    $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $runspace.ApartmentState = "STA"
-    $runspace.ThreadOptions  = "ReuseThread"
-    $runspace.Open()
-    $runspace.SessionStateProxy.SetVariable("sync",    $sync)
-    $runspace.SessionStateProxy.SetVariable("workDir", $workDir)
-
-    $script = [Management.Automation.PowerShell]::Create()
-    $script.Runspace = $runspace
-    $script.AddScript({
-
-        function Log($msg) {
-            $ts = (Get-Date).ToString("HH:mm:ss")
-            $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync["WPFWin11ISOStatusLog"].Text += "`n[$ts] $msg"
-                $sync["WPFWin11ISOStatusLog"].CaretIndex = $sync["WPFWin11ISOStatusLog"].Text.Length
-                $sync["WPFWin11ISOStatusLog"].ScrollToEnd()
-            })
-            Add-Content -Path (Join-Path $workDir "WinUtil_Win11ISO.log") -Value "[$ts] $msg"
-        }
-
-        function SetProgress($label, $pct) {
-            $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync.progressBarTextBlock.Text    = $label
-                $sync.progressBarTextBlock.ToolTip = $label
-                $sync.ProgressBar.Value            = [Math]::Max($pct, 5)
-            })
-        }
-
+    Start-WinUtilISORunspace -Variables @{ workDir = $workDir } -ScriptBlock {
         try {
             if ($workDir) {
                 $mountDir = Join-Path $workDir "wim_mount"
@@ -1854,26 +1909,26 @@ function Invoke-WinUtilISOCleanAndReset {
                                      Where-Object { $_.Path -like "$workDir*" }
                     if ($mountedImages) {
                         foreach ($img in $mountedImages) {
-                            Log "Dismounting WIM at: $($img.Path) (discarding changes)..."
-                            SetProgress "Dismounting WIM image..." 3
+                            Write-Win11ISOLog "Dismounting WIM at: $($img.Path) (discarding changes)..."
+                            Set-Win11ISOProgress "Dismounting WIM image..." 3
                             Dismount-WindowsImage -Path $img.Path -Discard
-                            Log "WIM dismounted successfully."
+                            Write-Win11ISOLog "WIM dismounted successfully."
                         }
                     } elseif (Test-Path $mountDir) {
-                        Log "No mounted WIM reported by Get-WindowsImage. Running DISM /Cleanup-Wim as a precaution..."
-                        SetProgress "Running DISM cleanup..." 3
-                        & dism /English /Cleanup-Wim | ForEach-Object { Log $_ }
+                        Write-Win11ISOLog "No mounted WIM reported by Get-WindowsImage. Running DISM /Cleanup-Wim as a precaution..."
+                        Set-Win11ISOProgress "Running DISM cleanup..." 3
+                        & dism /English /Cleanup-Wim | ForEach-Object { Write-Win11ISOLog $_ }
                     }
                 } catch {
-                    Log "Warning: could not dismount WIM cleanly. Attempting DISM /Cleanup-Wim fallback: $_"
-                    try { & dism /English /Cleanup-Wim | ForEach-Object { Log $_ } }
-                    catch { Log "Warning: DISM /Cleanup-Wim also failed: $_" }
+                    Write-Win11ISOLog "Warning: could not dismount WIM cleanly. Attempting DISM /Cleanup-Wim fallback: $_"
+                    try { & dism /English /Cleanup-Wim | ForEach-Object { Write-Win11ISOLog $_ } }
+                    catch { Write-Win11ISOLog "Warning: DISM /Cleanup-Wim also failed: $_" }
                 }
             }
 
             if ($workDir -and (Test-Path $workDir)) {
-                Log "Scanning files to delete in: $workDir"
-                SetProgress "Scanning files..." 5
+                Write-Win11ISOLog "Scanning files to delete in: $workDir"
+                Set-Win11ISOProgress "Scanning files..." 5
 
                 $allFiles = @(Get-ChildItem -Path $workDir -File -Recurse -Force)
                 $allDirs  = @(Get-ChildItem -Path $workDir -Directory -Recurse -Force |
@@ -1881,14 +1936,14 @@ function Invoke-WinUtilISOCleanAndReset {
                 $total   = $allFiles.Count
                 $deleted = 0
 
-                Log "Found $total files to delete."
+                Write-Win11ISOLog "Found $total files to delete."
 
                 foreach ($f in $allFiles) {
-                    try { Remove-Item -Path $f.FullName -Force } catch { Log "WARNING: could not delete $($f.FullName): $_" }
+                    try { Remove-Item -Path $f.FullName -Force } catch { Write-Win11ISOLog "WARNING: could not delete $($f.FullName): $_" }
                     $deleted++
                     if ($deleted % 100 -eq 0 -or $deleted -eq $total) {
                         $pct = [math]::Round(($deleted / [Math]::Max($total, 1)) * 85) + 5
-                        SetProgress "Deleting files in $($f.Directory.Name)... ($deleted / $total)" $pct
+                        Set-Win11ISOProgress "Deleting files in $($f.Directory.Name)... ($deleted / $total)" $pct
                     }
                 }
 
@@ -1899,16 +1954,16 @@ function Invoke-WinUtilISOCleanAndReset {
                 try { Remove-Item -Path $workDir -Recurse -Force } catch {}
 
                 if (Test-Path $workDir) {
-                    Log "WARNING: some items could not be deleted in $workDir"
+                    Write-Win11ISOLog "WARNING: some items could not be deleted in $workDir"
                 } else {
-                    Log "Temp directory deleted successfully."
+                    Write-Win11ISOLog "Temp directory deleted successfully."
                 }
             } else {
-                Log "No temp directory found ? resetting UI."
+                Write-Win11ISOLog "No temp directory found ? resetting UI."
             }
 
-            SetProgress "Resetting UI..." 95
-            Log "Resetting interface..."
+            Set-Win11ISOProgress "Resetting UI..." 95
+            Write-Win11ISOLog "Resetting interface..."
 
             $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
                 $sync["Win11ISOWorkDir"]     = $null
@@ -1918,6 +1973,7 @@ function Invoke-WinUtilISOCleanAndReset {
                 $sync["Win11ISOWimPath"]     = $null
                 $sync["Win11ISOImageInfo"]   = $null
                 $sync["Win11ISOUSBDisks"]    = $null
+                $sync["Win11ISOLogFile"]     = $null
 
                 $sync["WPFWin11ISOPath"].Text                   = "No ISO selected..."
                 $sync["WPFWin11ISOFileInfo"].Visibility          = "Collapsed"
@@ -1930,24 +1986,17 @@ function Invoke-WinUtilISOCleanAndReset {
                 $sync["WPFWin11ISOModifyButton"].IsEnabled       = $true
                 $sync["WPFWin11ISOCleanResetButton"].IsEnabled   = $true
 
-                $sync.progressBarTextBlock.Text    = ""
-                $sync.progressBarTextBlock.ToolTip = ""
-                $sync.ProgressBar.Value            = 0
-
                 $sync["WPFWin11ISOStatusLog"].Text   = "Ready. Please select a Windows 11 ISO to begin."
             })
+            Set-Win11ISOProgress -Label "" -Percent 0
         } catch {
-            Log "ERROR during Clean & Reset: $_"
+            Write-Win11ISOLog "ERROR during Clean & Reset: $_"
+            Set-Win11ISOProgress -Label "" -Percent 0
             $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync.progressBarTextBlock.Text    = ""
-                $sync.progressBarTextBlock.ToolTip = ""
-                $sync.ProgressBar.Value            = 0
                 $sync["WPFWin11ISOCleanResetButton"].IsEnabled = $true
             })
         }
-    })
-
-    $script.BeginInvoke()
+    }
 }
 
 function Invoke-WinUtilISOExport {
@@ -2009,34 +2058,16 @@ function Invoke-WinUtilISOExport {
 
     $sync["WPFWin11ISOChooseISOButton"].IsEnabled = $false
 
-    $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $runspace.ApartmentState = "STA"
-    $runspace.ThreadOptions  = "ReuseThread"
-    $runspace.Open()
-    $runspace.SessionStateProxy.SetVariable("sync",        $sync)
-    $runspace.SessionStateProxy.SetVariable("contentsDir", $contentsDir)
-    $runspace.SessionStateProxy.SetVariable("outputISO",   $outputISO)
-    $runspace.SessionStateProxy.SetVariable("oscdimg",     $oscdimg)
+    $isoRunspaceVariables = @{
+        contentsDir = $contentsDir
+        outputISO   = $outputISO
+        oscdimg     = $oscdimg
+    }
 
-    $win11ISOLogFuncDef = "function Write-Win11ISOLog {`n" + ${function:Write-Win11ISOLog}.ToString() + "`n}"
-    $runspace.SessionStateProxy.SetVariable("win11ISOLogFuncDef", $win11ISOLogFuncDef)
-
-    $script = [Management.Automation.PowerShell]::Create()
-    $script.Runspace = $runspace
-    $script.AddScript({
-        . ([scriptblock]::Create($win11ISOLogFuncDef))
-
-        function SetProgress($label, $pct) {
-            $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync.progressBarTextBlock.Text    = $label
-                $sync.progressBarTextBlock.ToolTip = $label
-                $sync.ProgressBar.Value            = [Math]::Max($pct, 5)
-            })
-        }
-
+    Start-WinUtilISORunspace -Variables $isoRunspaceVariables -ScriptBlock {
         try {
             Write-Win11ISOLog "Exporting to ISO: $outputISO"
-            SetProgress "Building ISO..." 10
+            Set-Win11ISOProgress "Building ISO..." 10
 
             $bootData    = "2#p0,e,b`"$contentsDir\boot\etfsboot.com`"#pEF,e,b`"$contentsDir\efi\microsoft\boot\efisys.bin`""
             $oscdimgArgs = @("-m", "-o", "-u2", "-udfver102", "-bootdata:$bootData", "-l`"CTOS_MODIFIED`"", "`"$contentsDir`"", "`"$outputISO`"")
@@ -2070,7 +2101,7 @@ function Invoke-WinUtilISOExport {
             }
 
             if ($proc.ExitCode -eq 0) {
-                SetProgress "ISO exported" 100
+                Set-Win11ISOProgress "ISO exported" 100
                 Write-Win11ISOLog "ISO exported successfully: $outputISO"
                 $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
                     [System.Windows.MessageBox]::Show("ISO exported successfully!`n`n$outputISO", "Export Complete", "OK", "Info")
@@ -2090,16 +2121,12 @@ function Invoke-WinUtilISOExport {
             })
         } finally {
             Start-Sleep -Milliseconds 800
+            Set-Win11ISOProgress -Label "" -Percent 0
             $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync.progressBarTextBlock.Text    = ""
-                $sync.progressBarTextBlock.ToolTip = ""
-                $sync.ProgressBar.Value            = 0
                 $sync["WPFWin11ISOChooseISOButton"].IsEnabled = $true
             })
         }
-    })
-
-    $script.BeginInvoke()
+    }
 }
 function Invoke-WinUtilISOScript {
     <#
@@ -2514,34 +2541,7 @@ function Invoke-WinUtilISOWriteUSB {
     $sync["WPFWin11ISOWriteUSBButton"].IsEnabled = $false
     Write-Win11ISOLog "Starting USB write to Disk $diskNum..."
 
-    $runspace = [Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $runspace.ApartmentState = "STA"
-    $runspace.ThreadOptions  = "ReuseThread"
-    $runspace.Open()
-    $runspace.SessionStateProxy.SetVariable("sync",        $sync)
-    $runspace.SessionStateProxy.SetVariable("diskNum",     $diskNum)
-    $runspace.SessionStateProxy.SetVariable("contentsDir", $contentsDir)
-
-    $script = [Management.Automation.PowerShell]::Create()
-    $script.Runspace = $runspace
-    $script.AddScript({
-
-        function Log($msg) {
-            $ts = (Get-Date).ToString("HH:mm:ss")
-            $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync["WPFWin11ISOStatusLog"].Text += "`n[$ts] $msg"
-                $sync["WPFWin11ISOStatusLog"].CaretIndex = $sync["WPFWin11ISOStatusLog"].Text.Length
-                $sync["WPFWin11ISOStatusLog"].ScrollToEnd()
-            })
-        }
-
-        function SetProgress($label, $pct) {
-            $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync.progressBarTextBlock.Text    = $label
-                $sync.progressBarTextBlock.ToolTip = $label
-                $sync.ProgressBar.Value            = [Math]::Max($pct, 5)
-            })
-        }
+    Start-WinUtilISORunspace -Variables @{ diskNum = $diskNum; contentsDir = $contentsDir } -ScriptBlock {
 
         function Get-FreeDriveLetter {
             $used = (Get-PSDrive -PSProvider FileSystem).Name
@@ -2552,23 +2552,23 @@ function Invoke-WinUtilISOWriteUSB {
         }
 
         try {
-            SetProgress "Formatting USB drive..." 10
+            Set-Win11ISOProgress "Formatting USB drive..." 10
 
             # Phase 1: Clean disk via diskpart (retry once if the drive is not yet ready)
             $dpFile1 = Join-Path $env:TEMP "winutil_diskpart_$(Get-Random).txt"
             "select disk $diskNum`nclean`nexit" | Set-Content -Path $dpFile1 -Encoding ASCII
-            Log "Running diskpart clean on Disk $diskNum..."
+            Write-Win11ISOLog "Running diskpart clean on Disk $diskNum..."
             $dpCleanOut = diskpart /s $dpFile1
-            $dpCleanOut | Where-Object { $_ -match '\S' } | ForEach-Object { Log "  diskpart: $_" }
+            $dpCleanOut | Where-Object { $_ -match '\S' } | ForEach-Object { Write-Win11ISOLog "  diskpart: $_" }
             Remove-Item $dpFile1 -Force
 
             if (($dpCleanOut -join ' ') -match 'device is not ready') {
-                Log "Disk $diskNum was not ready; waiting 5 seconds and retrying clean..."
+                Write-Win11ISOLog "Disk $diskNum was not ready; waiting 5 seconds and retrying clean..."
                 Start-Sleep -Seconds 5
                 Update-Disk -Number $diskNum
                 $dpFile1b = Join-Path $env:TEMP "winutil_diskpart_$(Get-Random).txt"
                 "select disk $diskNum`nclean`nexit" | Set-Content -Path $dpFile1b -Encoding ASCII
-                diskpart /s $dpFile1b | Where-Object { $_ -match '\S' } | ForEach-Object { Log "  diskpart: $_" }
+                diskpart /s $dpFile1b | Where-Object { $_ -match '\S' } | ForEach-Object { Write-Win11ISOLog "  diskpart: $_" }
                 Remove-Item $dpFile1b -Force
             }
 
@@ -2578,10 +2578,10 @@ function Invoke-WinUtilISOWriteUSB {
             $diskObj = Get-Disk -Number $diskNum
             if ($diskObj.PartitionStyle -eq 'RAW') {
                 Initialize-Disk -Number $diskNum -PartitionStyle GPT
-                Log "Disk $diskNum initialized as GPT."
+                Write-Win11ISOLog "Disk $diskNum initialized as GPT."
             } else {
                 Set-Disk -Number $diskNum -PartitionStyle GPT
-                Log "Disk $diskNum converted to GPT (was $($diskObj.PartitionStyle))."
+                Write-Win11ISOLog "Disk $diskNum converted to GPT (was $($diskObj.PartitionStyle))."
             }
 
             # Phase 3: Create FAT32 partition via diskpart, then format with Format-Volume
@@ -2593,7 +2593,7 @@ function Invoke-WinUtilISOWriteUSB {
             $createPartitionCommand = "create partition primary"
             if ($diskSizeMB -gt $maxFat32PartitionMB) {
                 $createPartitionCommand = "create partition primary size=$maxFat32PartitionMB"
-                Log "Disk $diskNum is $diskSizeMB MB; creating FAT32 partition capped at $maxFat32PartitionMB MB (32 GB)."
+                Write-Win11ISOLog "Disk $diskNum is $diskSizeMB MB; creating FAT32 partition capped at $maxFat32PartitionMB MB (32 GB)."
             }
 
             @(
@@ -2601,18 +2601,18 @@ function Invoke-WinUtilISOWriteUSB {
                 $createPartitionCommand
                 "exit"
             ) | Set-Content -Path $dpFile2 -Encoding ASCII
-            Log "Creating partitions on Disk $diskNum..."
-            diskpart /s $dpFile2 | Where-Object { $_ -match '\S' } | ForEach-Object { Log "  diskpart: $_" }
+            Write-Win11ISOLog "Creating partitions on Disk $diskNum..."
+            diskpart /s $dpFile2 | Where-Object { $_ -match '\S' } | ForEach-Object { Write-Win11ISOLog "  diskpart: $_" }
             Remove-Item $dpFile2 -Force
 
-            SetProgress "Formatting USB partition..." 25
+            Set-Win11ISOProgress "Formatting USB partition..." 25
             Start-Sleep -Seconds 3
             Update-Disk -Number $diskNum
 
             $partitions = Get-Partition -DiskNumber $diskNum
-            Log "Partitions on Disk $diskNum after creation: $($partitions.Count)"
+            Write-Win11ISOLog "Partitions on Disk $diskNum after creation: $($partitions.Count)"
             foreach ($p in $partitions) {
-                Log "  Partition $($p.PartitionNumber)  Type=$($p.Type)  Letter=$($p.DriveLetter)  Size=$([math]::Round($p.Size/1MB))MB"
+                Write-Win11ISOLog "  Partition $($p.PartitionNumber)  Type=$($p.Type)  Letter=$($p.DriveLetter)  Size=$([math]::Round($p.Size/1MB))MB"
             }
 
             $winpePart = $partitions | Where-Object { $_.Type -eq "Basic" } | Select-Object -Last 1
@@ -2622,12 +2622,12 @@ function Invoke-WinUtilISOWriteUSB {
 
             # Format using Format-Volume (reliable on fresh drives; diskpart format fails
             # with 'no volume selected' when the partition has never been formatted before)
-            Log "Formatting Partition $($winpePart.PartitionNumber) as FAT32 (label: $volLabel)..."
+            Write-Win11ISOLog "Formatting Partition $($winpePart.PartitionNumber) as FAT32 (label: $volLabel)..."
             Get-Partition -DiskNumber $diskNum -PartitionNumber $winpePart.PartitionNumber |
                 Format-Volume -FileSystem FAT32 -NewFileSystemLabel $volLabel -Force -Confirm:$false
-            Log "Partition $($winpePart.PartitionNumber) formatted as FAT32."
+            Write-Win11ISOLog "Partition $($winpePart.PartitionNumber) formatted as FAT32."
 
-            SetProgress "Assigning drive letters..." 30
+            Set-Win11ISOProgress "Assigning drive letters..." 30
             Start-Sleep -Seconds 2
             Update-Disk -Number $diskNum
 
@@ -2635,18 +2635,18 @@ function Invoke-WinUtilISOWriteUSB {
             $usbLetter = Get-FreeDriveLetter
             if (-not $usbLetter) { throw "No free drive letters (D-Z) available to assign to the USB data partition." }
             Set-Partition -DiskNumber $diskNum -PartitionNumber $winpePart.PartitionNumber -NewDriveLetter $usbLetter
-            Log "Assigned drive letter $usbLetter to WINPE partition (Partition $($winpePart.PartitionNumber))."
+            Write-Win11ISOLog "Assigned drive letter $usbLetter to WINPE partition (Partition $($winpePart.PartitionNumber))."
             Start-Sleep -Seconds 2
 
             $usbDrive = "${usbLetter}:"
             $retries = 0
             while (-not (Test-Path $usbDrive) -and $retries -lt 6) {
                 $retries++
-                Log "Waiting for $usbDrive to become accessible (attempt $retries/6)..."
+                Write-Win11ISOLog "Waiting for $usbDrive to become accessible (attempt $retries/6)..."
                 Start-Sleep -Seconds 2
             }
             if (-not (Test-Path $usbDrive)) { throw "Drive $usbDrive is not accessible after letter assignment." }
-            Log "USB data partition: $usbDrive"
+            Write-Win11ISOLog "USB data partition: $usbDrive"
 
             $contentSizeBytes = (Get-ChildItem -LiteralPath $contentsDir -File -Recurse -Force | Measure-Object -Property Length -Sum).Sum
             if (-not $contentSizeBytes) { $contentSizeBytes = 0 }
@@ -2658,7 +2658,7 @@ function Invoke-WinUtilISOWriteUSB {
             $partitionCapacityGB = [math]::Round($partitionCapacityBytes / 1GB, 2)
             $partitionFreeGB = [math]::Round($partitionFreeBytes / 1GB, 2)
 
-            Log "Source content size: $contentSizeGB GB. USB partition capacity: $partitionCapacityGB GB, free: $partitionFreeGB GB."
+            Write-Win11ISOLog "Source content size: $contentSizeGB GB. USB partition capacity: $partitionCapacityGB GB, free: $partitionFreeGB GB."
 
             if ($contentSizeBytes -gt $partitionCapacityBytes) {
                 throw "ISO content ($contentSizeGB GB) is larger than the USB partition capacity ($partitionCapacityGB GB). Use a larger USB drive or reduce image size."
@@ -2668,19 +2668,19 @@ function Invoke-WinUtilISOWriteUSB {
                 throw "Insufficient free space on USB partition. Required: $contentSizeGB GB, available: $partitionFreeGB GB."
             }
 
-            SetProgress "Copying Windows 11 files to USB..." 45
+            Set-Win11ISOProgress "Copying Windows 11 files to USB..." 45
 
             # Copy files; split install.wim if > 4 GB (FAT32 limit)
             $installWim = Join-Path $contentsDir "sources\install.wim"
             if (Test-Path $installWim) {
                 $wimSizeMB = [math]::Round((Get-Item $installWim).Length / 1MB)
                 if ($wimSizeMB -gt 3800) {
-                    Log "install.wim is $wimSizeMB MB - splitting for FAT32 compatibility... This will take several minutes."
+                    Write-Win11ISOLog "install.wim is $wimSizeMB MB - splitting for FAT32 compatibility... This will take several minutes."
                     $splitDest = Join-Path $usbDrive "sources\install.swm"
                     New-Item -ItemType Directory -Path (Split-Path $splitDest) -Force
                     Split-WindowsImage -ImagePath $installWim -SplitImagePath $splitDest -FileSize 3800 -CheckIntegrity
-                    Log "install.wim split complete."
-                    Log "Copying remaining files to USB..."
+                    Write-Win11ISOLog "install.wim split complete."
+                    Write-Win11ISOLog "Copying remaining files to USB..."
                     & robocopy $contentsDir $usbDrive /E /XF install.wim /NFL /NDL /NJH /NJS
                 } else {
                     & robocopy $contentsDir $usbDrive /E /NFL /NDL /NJH /NJS
@@ -2689,10 +2689,10 @@ function Invoke-WinUtilISOWriteUSB {
                 & robocopy $contentsDir $usbDrive /E /NFL /NDL /NJH /NJS
             }
 
-            SetProgress "Finalising USB drive..." 90
-            Log "Files copied to USB."
-            SetProgress "USB write complete" 100
-            Log "USB drive is ready for use."
+            Set-Win11ISOProgress "Finalising USB drive..." 90
+            Write-Win11ISOLog "Files copied to USB."
+            Set-Win11ISOProgress "USB write complete" 100
+            Write-Win11ISOLog "USB drive is ready for use."
 
             $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
                 [System.Windows.MessageBox]::Show(
@@ -2700,22 +2700,18 @@ function Invoke-WinUtilISOWriteUSB {
                     "USB Ready", "OK", "Info")
             })
         } catch {
-            Log "ERROR during USB write: $_"
+            Write-Win11ISOLog "ERROR during USB write: $_"
             $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
                 [System.Windows.MessageBox]::Show("USB write failed:`n`n$_", "USB Write Error", "OK", "Error")
             })
         } finally {
             Start-Sleep -Milliseconds 800
+            Set-Win11ISOProgress -Label "" -Percent 0
             $sync["WPFWin11ISOStatusLog"].Dispatcher.Invoke([action]{
-                $sync.progressBarTextBlock.Text    = ""
-                $sync.progressBarTextBlock.ToolTip = ""
-                $sync.ProgressBar.Value            = 0
                 $sync["WPFWin11ISOWriteUSBButton"].IsEnabled = $true
             })
         }
-    })
-
-    $script.BeginInvoke()
+    }
 }
 function Invoke-WinUtilScript {
     <#
@@ -3563,6 +3559,102 @@ function Set-WinUtilTaskbaritem {
         $sync["Form"].taskbarItemInfo.Description = $description
     }
 }
+function Set-WinUtilTaskbarStatus {
+    <#
+    .SYNOPSIS
+        Applies one of the taskbar item states used while a WinUtil process runs, on the UI thread
+    .PARAMETER Status
+        'Running' starts the progress indication, 'Success' clears it with a checkmark and 'Error'
+        marks the taskbar item as failed
+    .PARAMETER ItemCount
+        The number of items being processed, a single item is shown as indeterminate progress
+    #>
+    param(
+        [Parameter(Mandatory, Position=0)]
+        [ValidateSet("Running", "Success", "Error")]
+        [string]$Status,
+        [int]$ItemCount
+    )
+
+    switch ($Status) {
+        "Running" {
+            $state = if ($ItemCount -eq 1) { "Indeterminate" } else { "Normal" }
+            Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state $state -value 0.01 -overlay "logo" }
+        }
+        "Success" { Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "None" -overlay "checkmark" } }
+        "Error"   { Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Error" -overlay "warning" } }
+    }
+}
+function Set-WinUtilUpdateScheduledTaskState {
+    <#
+    .SYNOPSIS
+        Enables or disables every scheduled task related to Windows Update
+    .PARAMETER State
+        'Enabled' enables the tasks, 'Disabled' disables them
+    #>
+    param(
+        [Parameter(Mandatory, Position=0)]
+        [ValidateSet("Enabled", "Disabled")]
+        [string]$State
+    )
+
+    $taskPaths =
+        '\Microsoft\Windows\InstallService\*',
+        '\Microsoft\Windows\UpdateOrchestrator\*',
+        '\Microsoft\Windows\UpdateAssistant\*',
+        '\Microsoft\Windows\WaaSMedic\*',
+        '\Microsoft\Windows\WindowsUpdate\*',
+        '\Microsoft\WindowsUpdate\*'
+
+    foreach ($taskPath in $taskPaths) {
+        $tasks = Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue
+        if ($State -eq "Enabled") {
+            $tasks | Enable-ScheduledTask -ErrorAction SilentlyContinue
+        } else {
+            $tasks | Disable-ScheduledTask -ErrorAction SilentlyContinue
+        }
+    }
+}
+function Show-WinUtilMessageBox {
+    <#
+    .SYNOPSIS
+        Displays a WPF message box and returns the result
+    .PARAMETER Message
+        The body of the message box
+    .PARAMETER Title
+        The title of the message box
+    .PARAMETER Button
+        The set of buttons to display
+    .PARAMETER Icon
+        The icon to display
+    #>
+    param(
+        [Parameter(Mandatory, Position=0)][string]$Message,
+        [Parameter(Position=1)][string]$Title = "Winutil",
+        [ValidateSet("OK", "OKCancel", "YesNo", "YesNoCancel")][string]$Button = "OK",
+        [ValidateSet("None", "Hand", "Error", "Stop", "Question", "Exclamation", "Warning", "Asterisk", "Information")][string]$Icon = "Information"
+    )
+
+    return [System.Windows.MessageBox]::Show($Message, $Title, [System.Windows.MessageBoxButton]::$Button, [System.Windows.MessageBoxImage]::$Icon)
+}
+function Test-WinUtilProcessBusy {
+    <#
+    .SYNOPSIS
+        Returns true and warns the user when another WinUtil process is already running
+    .PARAMETER Caller
+        The name of the calling function, shown in the warning
+    #>
+    param(
+        [Parameter(Mandatory, Position=0)][string]$Caller
+    )
+
+    if (-not $sync.ProcessRunning) {
+        return $false
+    }
+
+    [void](Show-WinUtilMessageBox -Message "[$Caller] A process is currently running." -Icon "Warning")
+    return $true
+}
 function Show-CustomDialog {
     <#
     .SYNOPSIS
@@ -3894,28 +3986,20 @@ function Test-WinUtilPackageManager {
 
     if ($winget) {
         if (Get-Command winget -ErrorAction SilentlyContinue) {
-            Write-Host "===========================================" -ForegroundColor Green
-            Write-Host "---        WinGet is installed          ---" -ForegroundColor Green
-            Write-Host "===========================================" -ForegroundColor Green
+            Write-WinUtilBanner "WinGet is installed" -ForegroundColor Green
             $status = "installed"
         } else {
-            Write-Host "===========================================" -ForegroundColor Red
-            Write-Host "---      WinGet is not installed        ---" -ForegroundColor Red
-            Write-Host "===========================================" -ForegroundColor Red
+            Write-WinUtilBanner "WinGet is not installed" -ForegroundColor Red
             $status = "not-installed"
         }
     }
 
     if ($choco) {
         if (Get-Command choco -ErrorAction SilentlyContinue) {
-            Write-Host "===========================================" -ForegroundColor Green
-            Write-Host "---      Chocolatey is installed        ---" -ForegroundColor Green
-            Write-Host "===========================================" -ForegroundColor Green
+            Write-WinUtilBanner "Chocolatey is installed" -ForegroundColor Green
             $status = "installed"
         } else {
-            Write-Host "===========================================" -ForegroundColor Red
-            Write-Host "---    Chocolatey is not installed      ---" -ForegroundColor Red
-            Write-Host "===========================================" -ForegroundColor Red
+            Write-WinUtilBanner "Chocolatey is not installed" -ForegroundColor Red
             $status = "not-installed"
         }
     }
@@ -4230,20 +4314,14 @@ function Invoke-WPFFeatureInstall {
 
     #>
 
-    if($sync.ProcessRunning) {
-        $msg = "[Invoke-WPFFeatureInstall] Install process is currently running."
-        [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+    if (Test-WinUtilProcessBusy -Caller "Invoke-WPFFeatureInstall") {
         return
     }
 
     $handle = Invoke-WPFRunspace -ScriptBlock {
         $Features = $sync.selectedFeatures
         $sync.ProcessRunning = $true
-        if ($Features.count -eq 1) {
-            Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Indeterminate" -value 0.01 -overlay "logo" }
-        } else {
-            Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Normal" -value 0.01 -overlay "logo" }
-        }
+        Set-WinUtilTaskbarStatus -Status "Running" -ItemCount $Features.count
 
         $x = 0
 
@@ -4254,12 +4332,9 @@ function Invoke-WPFFeatureInstall {
         }
 
         $sync.ProcessRunning = $false
-        Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "None" -overlay "checkmark" }
+        Set-WinUtilTaskbarStatus -Status "Success"
 
-        Write-Host "==================================="
-        Write-Host "---   Features are Installed    ---"
-        Write-Host "---  A Reboot may be required   ---"
-        Write-Host "==================================="
+        Write-WinUtilBanner @("Features are Installed", "A Reboot may be required")
     }
 }
 function Invoke-WPFFixesNetwork {
@@ -4294,9 +4369,7 @@ function Invoke-WPFFixesNetwork {
     $MessageIcon = [System.Windows.MessageBoxImage]::Information
 
     [System.Windows.MessageBox]::Show($Messageboxbody, $MessageboxTitle, $ButtonType, $MessageIcon)
-    Write-Host "=========================================="
-    Write-Host "-- Network Configuration has been Reset --"
-    Write-Host "=========================================="
+    Write-WinUtilBanner "Network Configuration has been Reset"
 }
 function Invoke-WPFFixesNTPPool {
     <#
@@ -4314,9 +4387,7 @@ function Invoke-WPFFixesNTPPool {
     Restart-Service w32time
     w32tm /resync
 
-    Write-Host "================================="
-    Write-Host "-- NTP Configuration Complete ---"
-    Write-Host "================================="
+    Write-WinUtilBanner "NTP Configuration Complete"
 }
 function Invoke-WPFFixesUpdate {
 
@@ -4527,9 +4598,7 @@ function Invoke-WPFFixesUpdate {
     $MessageIcon = [System.Windows.MessageBoxImage]::Information
 
     [System.Windows.MessageBox]::Show($Messageboxbody, $MessageboxTitle, $ButtonType, $MessageIcon)
-    Write-Host "==============================================="
-    Write-Host "-- Reset All Windows Update Settings to Stock -"
-    Write-Host "==============================================="
+    Write-WinUtilBanner "Reset All Windows Update Settings to Stock"
 
     # Remove the progress bars
     Write-Progress -Id 0 -Activity "Repairing Windows Update" -Completed
@@ -4578,9 +4647,7 @@ function Invoke-WPFGetInstalled {
 
     #>
     param($checkbox)
-    if ($sync.ProcessRunning) {
-        $msg = "[Invoke-WPFGetInstalled] Install process is currently running."
-        [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+    if (Test-WinUtilProcessBusy -Caller "Invoke-WPFGetInstalled") {
         return
     }
 
@@ -4741,15 +4808,12 @@ function Invoke-WPFInstall {
     $PackagesToInstall = $sync.selectedApps | Foreach-Object { $sync.configs.applicationsHashtable.$_ }
 
 
-    if($sync.ProcessRunning) {
-        $msg = "[Invoke-WPFInstall] An Install process is currently running."
-        [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+    if (Test-WinUtilProcessBusy -Caller "Invoke-WPFInstall") {
         return
     }
 
     if ($PackagesToInstall.Count -eq 0) {
-        $WarningMsg = "Please select the program(s) to install or upgrade."
-        [System.Windows.MessageBox]::Show($WarningMsg, $AppTitle, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        Show-WinUtilMessageBox -Message "Please select the program(s) to install or upgrade." -Title $AppTitle -Icon "Warning"
         return
     }
 
@@ -4775,15 +4839,11 @@ function Invoke-WPFInstall {
                 Install-WinUtilProgramChoco -Action Install -Programs $packagesChoco
             }
             Hide-WPFInstallAppBusy
-            Write-Host "==========================================="
-            Write-Host "--      Installs have finished          ---"
-            Write-Host "==========================================="
-            Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "None" -overlay "checkmark" }
+            Write-WinUtilBanner "Installs have finished"
+            Set-WinUtilTaskbarStatus -Status "Success"
         } catch {
-            Write-Host "==========================================="
-            Write-Host "Error: $_"
-            Write-Host "==========================================="
-            Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Error" -overlay "warning" }
+            Write-WinUtilBanner "Error: $_"
+            Set-WinUtilTaskbarStatus -Status "Error"
         }
         $sync.ProcessRunning = $False
     }
@@ -4792,19 +4852,13 @@ function Invoke-WPFInstallUpgrade {
     if ($sync.ChocoRadioButton.IsChecked) {
         Install-WinUtilChoco # Ensure Chocolatey is installed before upgrading
 
-        Write-Host "==========================================="
-        Write-Host "--           Updates started            ---"
-        Write-Host "-- You can close this window if desired ---"
-        Write-Host "==========================================="
+        Write-WinUtilBanner @("Updates started", "You can close this window if desired")
 
         Start-Process -FilePath powershell.exe -ArgumentList 'choco upgrade all -y'
     } else {
         Install-WinUtilWinget # Ensure WinGet is installed before upgrading
 
-        Write-Host "==========================================="
-        Write-Host "--           Updates started            ---"
-        Write-Host "-- You can close this window if desired ---"
-        Write-Host "==========================================="
+        Write-WinUtilBanner @("Updates started", "You can close this window if desired")
 
         Start-Process -FilePath powershell.exe -ArgumentList 'winget upgrade --all --include-unknown --silent --accept-source-agreements --accept-package-agreements'
     }
@@ -5110,9 +5164,7 @@ function Invoke-WPFSSHServer {
 
         Invoke-WinUtilSSHServer
 
-        Write-Host "======================================="
-        Write-Host "--     OpenSSH Server installed!    ---"
-        Write-Host "======================================="
+        Write-WinUtilBanner "OpenSSH Server installed!"
     }
 }
 function Invoke-WPFSystemRepair {
@@ -5252,9 +5304,7 @@ function Invoke-WPFtweaksbutton {
 
   #>
 
-  if($sync.ProcessRunning) {
-    $msg = "[Invoke-WPFtweaksbutton] Install process is currently running."
-    [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+  if (Test-WinUtilProcessBusy -Caller "Invoke-WPFtweaksbutton") {
     return
   }
 
@@ -5270,8 +5320,7 @@ function Invoke-WPFtweaksbutton {
   $completedSteps = 0
 
   if ($tweaks.count -eq 0 -and $dnsProvider -eq "Default") {
-    $msg = "Please check the tweaks you wish to perform."
-    [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+    Show-WinUtilMessageBox -Message "Please check the tweaks you wish to perform." -Icon "Warning"
     return
   }
 
@@ -5279,12 +5328,7 @@ function Invoke-WPFtweaksbutton {
 
   if ($restorePointSelected) {
     $sync.ProcessRunning = $true
-
-    if ($Tweaks.Count -eq 1) {
-        Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Indeterminate" -value 0.01 -overlay "logo" }
-    } else {
-        Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Normal" -value 0.01 -overlay "logo" }
-    }
+    Set-WinUtilTaskbarStatus -Status "Running" -ItemCount $Tweaks.Count
 
     Set-WinUtilProgressBar -Label "Creating restore point" -Percent 0
     Invoke-WinUtilTweaks $restorePointTweak
@@ -5293,10 +5337,8 @@ function Invoke-WPFtweaksbutton {
     if ($tweaksToRun.Count -eq 0 -and $dnsProvider -eq "Default") {
       Set-WinUtilProgressBar -Label "Tweaks finished" -Percent 100
       $sync.ProcessRunning = $false
-      Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "None" -overlay "checkmark" }
-      Write-Host "================================="
-      Write-Host "--     Tweaks are Finished    ---"
-      Write-Host "================================="
+      Set-WinUtilTaskbarStatus -Status "Success"
+      Write-WinUtilBanner "Tweaks are Finished"
       return
     }
   }
@@ -5309,11 +5351,7 @@ function Invoke-WPFtweaksbutton {
     $sync.ProcessRunning = $true
 
     if ($completedSteps -eq 0) {
-      if ($Tweaks.count -eq 1) {
-        Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Indeterminate" -value 0.01 -overlay "logo" }
-      } else {
-        Invoke-WPFUIThread -ScriptBlock{ Set-WinUtilTaskbaritem -state "Normal" -value 0.01 -overlay "logo" }
-      }
+      Set-WinUtilTaskbarStatus -Status "Running" -ItemCount $Tweaks.count
     }
 
     Set-WinUtilDNS -DNSProvider $dnsProvider
@@ -5327,10 +5365,8 @@ function Invoke-WPFtweaksbutton {
     }
     Set-WinUtilProgressBar -Label "Tweaks finished" -Percent 100
     $sync.ProcessRunning = $false
-    Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "None" -overlay "checkmark" }
-    Write-Host "================================="
-    Write-Host "--     Tweaks are Finished    ---"
-    Write-Host "================================="
+    Set-WinUtilTaskbarStatus -Status "Success"
+    Write-WinUtilBanner "Tweaks are Finished"
   }
 }
 function Invoke-WPFUIElements {
@@ -5794,17 +5830,14 @@ function Invoke-WPFundoall {
 
     #>
 
-    if($sync.ProcessRunning) {
-        $msg = "[Invoke-WPFundoall] Install process is currently running."
-        [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+    if (Test-WinUtilProcessBusy -Caller "Invoke-WPFundoall") {
         return
     }
 
     $tweaks = $sync.selectedTweaks
 
     if ($tweaks.count -eq 0) {
-        $msg = "Please check the tweaks you wish to undo."
-        [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        Show-WinUtilMessageBox -Message "Please check the tweaks you wish to undo." -Icon "Warning"
         return
     }
 
@@ -5812,11 +5845,7 @@ function Invoke-WPFundoall {
         param($tweaks)
 
         $sync.ProcessRunning = $true
-        if ($tweaks.count -eq 1) {
-            Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Indeterminate" -value 0.01 -overlay "logo" }
-        } else {
-            Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Normal" -value 0.01 -overlay "logo" }
-        }
+        Set-WinUtilTaskbarStatus -Status "Running" -ItemCount $tweaks.count
 
 
         for ($i = 0; $i -lt $tweaks.Count; $i++) {
@@ -5827,10 +5856,8 @@ function Invoke-WPFundoall {
 
         Set-WinUtilProgressBar -Label "Undo Tweaks Finished" -Percent 100
         $sync.ProcessRunning = $false
-        Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "None" -overlay "checkmark" }
-        Write-Host "=================================="
-        Write-Host "---  Undo Tweaks are Finished  ---"
-        Write-Host "=================================="
+        Set-WinUtilTaskbarStatus -Status "Success"
+        Write-WinUtilBanner "Undo Tweaks are Finished"
 
     }
 }
@@ -5845,24 +5872,16 @@ function Invoke-WPFUnInstall {
         Uninstalls the selected programs
     #>
 
-    if($sync.ProcessRunning) {
-        $msg = "[Invoke-WPFUnInstall] Install process is currently running"
-        [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+    if (Test-WinUtilProcessBusy -Caller "Invoke-WPFUnInstall") {
         return
     }
 
     if ($PackagesToUninstall.Count -eq 0) {
-        $WarningMsg = "Please select the program(s) to uninstall"
-        [System.Windows.MessageBox]::Show($WarningMsg, $AppTitle, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        Show-WinUtilMessageBox -Message "Please select the program(s) to uninstall" -Title $AppTitle -Icon "Warning"
         return
     }
 
-    $ButtonType = [System.Windows.MessageBoxButton]::YesNo
-    $MessageboxTitle = "Are you sure?"
-    $Messageboxbody = ("This will uninstall the following applications: `n $($PackagesToUninstall | Select-Object Name, Description| Out-String)")
-    $MessageIcon = [System.Windows.MessageBoxImage]::Information
-
-    $confirm = [System.Windows.MessageBox]::Show($Messageboxbody, $MessageboxTitle, $ButtonType, $MessageIcon)
+    $confirm = Show-WinUtilMessageBox -Message ("This will uninstall the following applications: `n $($PackagesToUninstall | Select-Object Name, Description| Out-String)") -Title "Are you sure?" -Button "YesNo"
 
     if($confirm -eq "No") {return}
 
@@ -5887,15 +5906,11 @@ function Invoke-WPFUnInstall {
                 Install-WinUtilProgramChoco -Action Uninstall -Programs $packagesChoco
             }
             Hide-WPFInstallAppBusy
-            Write-Host "==========================================="
-            Write-Host "--       Uninstalls have finished       ---"
-            Write-Host "==========================================="
-            Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "None" -overlay "checkmark" }
+            Write-WinUtilBanner "Uninstalls have finished"
+            Set-WinUtilTaskbarStatus -Status "Success"
         } catch {
-            Write-Host "==========================================="
-            Write-Host "Error: $_"
-            Write-Host "==========================================="
-           Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Error" -overlay "warning" }
+            Write-WinUtilBanner "Error: $_"
+            Set-WinUtilTaskbarStatus -Status "Error"
         }
         $sync.ProcessRunning = $False
 
@@ -5939,24 +5954,12 @@ function Invoke-WPFUpdatesdefault {
 
     Write-Host "Enabling update related scheduled tasks..." -ForegroundColor Green
 
-    $Tasks =
-        '\Microsoft\Windows\InstallService\*',
-        '\Microsoft\Windows\UpdateOrchestrator\*',
-        '\Microsoft\Windows\UpdateAssistant\*',
-        '\Microsoft\Windows\WaaSMedic\*',
-        '\Microsoft\Windows\WindowsUpdate\*',
-        '\Microsoft\WindowsUpdate\*'
-
-    foreach ($Task in $Tasks) {
-        Get-ScheduledTask -TaskPath $Task | Enable-ScheduledTask -ErrorAction SilentlyContinue
-    }
+    Set-WinUtilUpdateScheduledTaskState -State "Enabled"
 
     Write-Host "Windows Local Policies Reset to Default"
     secedit /configure /cfg "$Env:SystemRoot\inf\defltbase.inf" /db defltbase.sdb
 
-    Write-Host "===================================================" -ForegroundColor Green
-    Write-Host "---  Windows Update Settings Reset to Default   ---" -ForegroundColor Green
-    Write-Host "===================================================" -ForegroundColor Green
+    Write-WinUtilBanner "Windows Update Settings Reset to Default" -ForegroundColor Green
 
     Write-Host "Note: You must restart your system in order for all changes to take effect." -ForegroundColor Yellow
 }
@@ -5999,21 +6002,9 @@ function Invoke-WPFUpdatesdisable {
 
     Write-Host "Disabling update related scheduled tasks..." -ForegroundColor Yellow
 
-    $Tasks =
-        '\Microsoft\Windows\InstallService\*',
-        '\Microsoft\Windows\UpdateOrchestrator\*',
-        '\Microsoft\Windows\UpdateAssistant\*',
-        '\Microsoft\Windows\WaaSMedic\*',
-        '\Microsoft\Windows\WindowsUpdate\*',
-        '\Microsoft\WindowsUpdate\*'
+    Set-WinUtilUpdateScheduledTaskState -State "Disabled"
 
-    foreach ($Task in $Tasks) {
-        Get-ScheduledTask -TaskPath $Task | Disable-ScheduledTask -ErrorAction SilentlyContinue
-    }
-
-    Write-Host "=================================" -ForegroundColor Green
-    Write-Host "---   Updates Are Disabled    ---" -ForegroundColor Green
-    Write-Host "=================================" -ForegroundColor Green
+    Write-WinUtilBanner "Updates Are Disabled" -ForegroundColor Green
 
     Write-Host "Note: You must restart your system in order for all changes to take effect." -ForegroundColor Yellow
 }
@@ -6060,9 +6051,7 @@ function Invoke-WPFUpdatessecurity {
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoRebootWithLoggedOnUsers" -Type DWord -Value 1
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "AUPowerManagement" -Type DWord -Value 0
 
-    Write-Host "================================="
-    Write-Host "-- Updates Set to Recommended ---"
-    Write-Host "================================="
+    Write-WinUtilBanner "Updates Set to Recommended"
 }
 Function Show-CTTLogo {
     <#
