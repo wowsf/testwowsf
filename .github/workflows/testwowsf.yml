@@ -1,8 +1,8 @@
 name: three jobs
 
 on:
-  schedule:
-    - cron: '23,33,43 1 * * *' 
+#  schedule:
+#    - cron: '23,33,43 1 * * *' 
   workflow_dispatch: 
 
 jobs:
@@ -26,7 +26,7 @@ jobs:
         # run script
         rclone copy one:/jp/ . && bash git.sh
         
-        for i in {1..356}; do
+        for i in {1..357}; do
           echo "check-service Keep-alive heartbeat $i/360   $(date)"
           sleep 60
         done
