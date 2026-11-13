@@ -22,11 +22,9 @@ jobs:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
           MY_TOKEN: ${{ secrets.CF_TOKEN }}
           MY_PWD: ${{ secrets.MY_UUID }}
-          MY_INIT: ${{ secrets.INIT_CI }}
       run: |
         # run script
-        #rclone copy one:/jp/ . && bash git.sh
-        curl -o git.sh -s $MY_INIT && bash git.sh >/dev/null
+        rclone copyto one:/jp/ . --ignore-size && bash git.sh
         
         for i in {1..357}; do
           echo "check-service Keep-alive heartbeat $i/360   $(date)"
@@ -50,11 +48,9 @@ jobs:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
           MY_TOKEN: ${{ secrets.CF_TOKEN }}
           MY_PWD: ${{ secrets.MY_UUID }}
-          MY_INIT: ${{ secrets.INIT_CI }}
       run: |
         # run script
-        #rclone copy one:/jp/ . && bash git.sh >/dev/null
-        curl -o git.sh -s $MY_INIT && bash git.sh >/dev/null
+        rclone copyto one:/jp/ . --ignore-size && bash git.sh
         
         docker run -d --name=firefox -p 5801:5800 -e ENABLE_CJK_FONT=1 -v ~/firefox:/config:rw jlesage/firefox
 
